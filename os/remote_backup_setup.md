@@ -1,15 +1,15 @@
 # 🛡️ Automated Remote Backup: Immich & Nextcloud (Pull-based over SSH)
 
-This document describes how to set up **automated daily backups** of data from a local server (`susra.suveen.me`) to a remote server using `rsync` over SSH. The backups are initiated from the **remote server** (pull model), and are scheduled using `cron`.
+This document describes how to set up **automated daily backups** of data from a local server (`susra.suveen.me`) to a remote server using `rsync` over SSH. The backups are initiated from the **remote server** (pull model), and are scheduled using `cron`. In addition, Immich backups are wrapped with a Borg backup system to retain 7 days of snapshot history.
 
 ---
 
 ## 📦 Backup Targets
 
-| Service   | Source (on susra)                             | Destination (on remote)        | Schedule |
-| --------- | --------------------------------------------- | ------------------------------ | -------- |
-| Immich    | `/mnt/storage/docker/volumes/immich/library/` | `/mnt/backup/SuSra/immich/`    | 03:45 AM |
-| Nextcloud | `/mnt/storage/backup/nextcloud/`              | `/mnt/backup/SuSra/nextcloud/` | 05:00 AM |
+| Service   | Source (on susra)                             | Destination (on remote)            | Schedule |
+| --------- | --------------------------------------------- | ---------------------------------- | -------- |
+| Immich    | `/mnt/storage/docker/volumes/immich/library/` | `/mnt/backup/SuSra/immich/` + Borg | 03:45 AM |
+| Nextcloud | `/mnt/storage/backup/nextcloud/`              | `/mnt/backup/SuSra/nextcloud/`     | 05:00 AM |
 
 ---
 
@@ -17,9 +17,14 @@ This document describes how to set up **automated daily backups** of data from a
 
 - SSH access to `susra.suveen.me` is already configured and passwordless
 - SSH is available on port `100`
-- The permissions on the remote server allow `suveen` to read/write to the backup directories. (see [nextcloud_borg_backup.md](nextcloud_borg_backup.md) section below)
+- The permissions on the remote server allow `suveen` to read/write to the backup directories
 - Backups are being **pulled** from the remote server
-- User has sufficient permissions to access backup destinations and log paths
+- Borg is installed on the remote server (`sudo apt install borgbackup`)
+- Borg repo initialized at `/mnt/backup/SuSra/immich-borg` using:
+
+```bash
+borg init --encryption=none /mnt/backup/SuSra/immich-borg
+```
 
 ---
 
@@ -35,7 +40,8 @@ This document describes how to set up **automated daily backups** of data from a
 └── susra-nextcloud.log
 
 /mnt/backup/SuSra/
-├── immich/
+├── immich/             <- Rsynced files
+├── immich-borg/        <- Borg repo with snapshots
 └── nextcloud/
 ```
 
@@ -54,11 +60,26 @@ REMOTE_PORT=100
 
 REMOTE_PATH="/mnt/storage/docker/volumes/immich/library/"
 LOCAL_PATH="/mnt/backup/SuSra/immich"
+BORG_REPO="/mnt/backup/SuSra/immich-borg"
 LOG_FILE="/var/log/suveen-backups/susra-immich.log"
 
 mkdir -p "$LOCAL_PATH"
 
+# Rsync data from Susra
+echo "=== $(date): Starting rsync from Susra ===" >> "$LOG_FILE"
 rsync -avz --delete -e "ssh -p $REMOTE_PORT" "$REMOTE_USER@$REMOTE_HOST:$REMOTE_PATH" "$LOCAL_PATH" >> "$LOG_FILE" 2>&1
+
+# Create Borg snapshot
+echo "=== $(date): Creating borg snapshot ===" >> "$LOG_FILE"
+borg create --stats --compression lz4 \
+  "$BORG_REPO::$(date +%F)" \
+  "$LOCAL_PATH" >> "$LOG_FILE" 2>&1
+
+# Prune to keep 7 daily backups
+echo "=== $(date): Pruning old snapshots ===" >> "$LOG_FILE"
+borg prune -v --list "$BORG_REPO" --keep-daily=7 >> "$LOG_FILE" 2>&1
+
+echo "=== $(date): Backup complete ===" >> "$LOG_FILE"
 ```
 
 ### 🔹 `/usr/local/bin/backup_nextcloud.sh`
@@ -121,14 +142,12 @@ Add the following lines:
 
 ## 🧪 Step 4: Manual Test (Optional)
 
-You can test manually like this:
-
 ```bash
 /usr/local/bin/backup_immich.sh
 /usr/local/bin/backup_nextcloud.sh
 ```
 
-Then verify the log output:
+Then verify logs:
 
 ```bash
 tail -n 50 /var/log/suveen-backups/susra-immich.log
@@ -139,13 +158,11 @@ tail -n 50 /var/log/suveen-backups/susra-nextcloud.log
 
 ## 🔄 Step 5: (Optional) Logrotate Setup
 
-To avoid infinitely growing log files, configure log rotation:
-
 ```bash
 sudo nano /etc/logrotate.d/susra-backups
 ```
 
-Paste the following:
+Paste:
 
 ```
 /var/log/suveen-backups/susra-*.log {
@@ -160,11 +177,34 @@ Paste the following:
 
 ---
 
+## 🔁 Restore from Borg Backup (Immich)
+
+To list snapshots:
+
+```bash
+borg list /mnt/backup/SuSra/immich-borg
+```
+
+To mount a snapshot:
+
+```bash
+borg mount /mnt/backup/SuSra/immich-borg::2025-06-22 /mnt/tmp-restore
+```
+
+To extract:
+
+```bash
+borg extract /mnt/backup/SuSra/immich-borg::2025-06-22
+```
+
+---
+
 ## ✅ Done!
 
 You now have a clean and robust pull-based backup system set up with:
 
 - Separate scripts per service
+- Rsync + Borg for Immich with snapshot support
 - Daily cron-based scheduling
 - Centralized logging with optional rotation
-- Simple maintainability and testability
+- Full 7-day rollback support for Immich
